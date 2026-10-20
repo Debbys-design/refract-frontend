@@ -1,179 +1,211 @@
-import { API_BASE_URL } from "@/lib/api/client";
-
-type Handler = (payload: unknown) => void;
-
 /**
- * Backoff policy for the reconnecting WebSocket. Kept as a plain config
- * object so the pure `computeBackoff` helper can be unit-tested without a
- * socket, and so callers/tests can override the clock and jitter source.
- */
-export interface BackoffConfig {
-  /** Delay for the first retry, in milliseconds. */
-  baseMs: number;
-  /** Upper bound on any single delay, in milliseconds. */
-  maxMs: number;
-  /** How long a connection must stay open before the budget resets. */
-  stableThresholdMs: number;
-  /** Injectable RNG in [0, 1) for deterministic tests. */
-  random: () => number;
-}
-
-export const DEFAULT_BACKOFF_CONFIG: BackoffConfig = {
-  baseMs: 500,
-  maxMs: 30_000,
-  stableThresholdMs: 10_000,
-  random: Math.random,
-};
-
-/**
- * Pure, lifecycle-independent backoff calculation. Uses "decorrelated"
- * jitter: the delay is drawn uniformly from [base, min(max, prev * 3)] so
- * clients that failed together do not retry in lockstep. The result is
- * always a positive, capped integer.
- */
-export function computeBackoff(
-  attempt: number,
-  config: BackoffConfig = DEFAULT_BACKOFF_CONFIG,
-): number {
-  const { baseMs, maxMs, random } = config;
-  const safeAttempt = Math.max(0, Math.floor(attempt));
-  // Exponential ceiling for this attempt, capped at maxMs.
-  const ceiling = Math.min(maxMs, baseMs * 2 ** safeAttempt);
-  const floor = Math.min(baseMs, ceiling);
-  const span = ceiling - floor;
-  const jittered = floor + span * random();
-  // Guard against zero/negative delays from a misbehaving RNG.
-  return Math.max(1, Math.min(maxMs, Math.round(jittered)));
-}
-
-/**
- * A small reconnecting WebSocket wrapper exposing a subscribe-by-topic API.
- * The backend contract this assumes (documented, not yet implemented
- * upstream): connect to `${wsUrl}`, receive JSON messages shaped
- * `{ topic: string, payload: unknown }`, one topic per push-based update
- * type (e.g. "oracle_update"). Callers must treat this connection as
- * best-effort — always keep an independent REST fetch as the source of
- * truth for initial state.
+ * Realtime WebSocket client.
  *
- * Reconnects use capped exponential backoff with jitter (see
- * `computeBackoff`). The backoff budget only resets once a connection has
- * been stable for `stableThresholdMs`, so rapid open/close cycles keep
- * escalating instead of producing a reconnect storm.
+ * Handles connection lifecycle, subscription replay, and auth token expiry
+ * for wallet-scoped subscriptions. Token acquisition is isolated behind an
+ * injected AuthTokenProvider so the transport stays wallet-agnostic.
  */
-class RealtimeClient {
+
+import type {
+  AuthTokenProvider,
+  AuthenticatedSubscription,
+  RealtimeAuthOptions,
+  RealtimeCloseCode,
+  RealtimeConnectionState,
+  RealtimeDegradedState,
+} from './types';
+
+const AUTH_CLOSE_CODES: ReadonlySet<number> = new Set([4001, 4003, 4401, 4403]);
+const DEFAULT_MAX_REFRESH_ATTEMPTS = 2;
+
+export interface RealtimeClientOptions extends RealtimeAuthOptions {
+  url: string;
+  onStateChange?: (state: RealtimeConnectionState) => void;
+  onDegraded?: (state: RealtimeDegradedState) => void;
+}
+
+export class RealtimeClient {
+  private readonly url: string;
+  private readonly auth?: AuthTokenProvider;
+  private readonly maxRefreshAttempts: number;
+  private readonly onStateChange?: (state: RealtimeConnectionState) => void;
+  private readonly onDegraded?: (state: RealtimeDegradedState) => void;
+
   private socket: WebSocket | null = null;
-  private handlers = new Map<string, Set<Handler>>();
-  private attempt = 0;
-  private closedByUser = false;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
-  private config: BackoffConfig = DEFAULT_BACKOFF_CONFIG;
+  private state: RealtimeConnectionState = 'idle';
+  private refreshAttempts = 0;
+  private refreshInFlight: Promise<string | null> | null = null;
+  private readonly authenticatedSubscriptions = new Map<string, AuthenticatedSubscription>();
 
-  connect(): void {
-    if (typeof WebSocket === "undefined" || this.socket) return;
-    this.closedByUser = false;
-    this.open();
+  constructor(options: RealtimeClientOptions) {
+    this.url = options.url;
+    this.auth = options.auth;
+    this.maxRefreshAttempts = options.maxRefreshAttempts ?? DEFAULT_MAX_REFRESH_ATTEMPTS;
+    this.onStateChange = options.onStateChange;
+    this.onDegraded = options.onDegraded;
   }
 
-  private open(): void {
-    const wsUrl = API_BASE_URL.replace(/^http/, "ws").replace(/\/api\/v1$/, "/ws");
-    try {
-      this.socket = new WebSocket(wsUrl);
-    } catch {
-      this.scheduleReconnect();
-      return;
-    }
-
-    this.socket.addEventListener("open", () => {
-      // Do NOT reset the budget here — only after the connection proves
-      // stable. Otherwise a flapping backend resets backoff every cycle.
-      this.clearStabilityTimer();
-      this.stabilityTimer = setTimeout(() => {
-        this.stabilityTimer = null;
-        this.attempt = 0;
-      }, this.config.stableThresholdMs);
-    });
-    this.socket.addEventListener("message", (event) => {
-      try {
-        const { topic, payload } = JSON.parse(event.data as string) as { topic: string; payload: unknown };
-        this.handlers.get(topic)?.forEach((handler) => handler(payload));
-      } catch {
-        // Malformed message — ignore, don't crash the connection.
-      }
-    });
-    this.socket.addEventListener("close", (event) => {
-      this.socket = null;
-      this.clearStabilityTimer();
-      if (!this.closedByUser) this.scheduleReconnect(event);
-    });
-    this.socket.addEventListener("error", () => {
-      this.socket?.close();
-    });
-  }
-
-  private scheduleReconnect(event?: CloseEvent): void {
-    if (this.reconnectTimer) return;
-    const delay = this.resolveDelay(event);
-    this.attempt += 1;
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      if (!this.closedByUser) this.open();
-    }, delay);
+  getState(): RealtimeConnectionState {
+    return this.state;
   }
 
   /**
-   * Compute the next delay, honouring a server-provided retry hint when
-   * present. The hint may arrive as a `retry-after` header on the close
-   * event (seconds or ms) or be encoded in the close reason.
+   * Registers a wallet-scoped subscription that will be replayed after a
+   * successful re-authentication.
    */
-  private resolveDelay(event?: CloseEvent): number {
-    const hint = this.parseRetryAfter(event);
-    if (hint !== null) {
-      return Math.max(1, Math.min(this.config.maxMs, hint));
-    }
-    return computeBackoff(this.attempt, this.config);
+  registerAuthenticatedSubscription(sub: AuthenticatedSubscription): void {
+    this.authenticatedSubscriptions.set(sub.topic, sub);
   }
 
-  private parseRetryAfter(event?: CloseEvent): number | null {
-    if (!event) return null;
-    const header = event.reason?.match(/retry-after[:=]\s*(\d+(?:\.\d+)?)/i);
-    if (header) {
-      const value = Number(header[1]);
-      if (Number.isFinite(value) && value > 0) {
-        // Values under 1000 are treated as seconds, larger as milliseconds.
-        return value < 1000 ? value * 1000 : value;
-      }
-    }
-    return null;
+  unregisterAuthenticatedSubscription(topic: string): void {
+    this.authenticatedSubscriptions.delete(topic);
   }
 
-  private clearStabilityTimer(): void {
-    if (this.stabilityTimer) {
-      clearTimeout(this.stabilityTimer);
-      this.stabilityTimer = null;
-    }
-  }
-
-  subscribe(topic: string, handler: Handler): () => void {
-    if (!this.handlers.has(topic)) this.handlers.set(topic, new Set());
-    this.handlers.get(topic)!.add(handler);
-    this.connect();
-
-    return () => {
-      this.handlers.get(topic)?.delete(handler);
-    };
+  async connect(): Promise<void> {
+    this.setState('connecting');
+    const token = await this.resolveToken();
+    this.openSocket(token);
   }
 
   disconnect(): void {
-    this.closedByUser = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    this.clearStabilityTimer();
-    this.socket?.close();
+    this.socket?.close(1000, 'client disconnect');
     this.socket = null;
+    this.setState('closed');
+  }
+
+  private async resolveToken(): Promise<string | null> {
+    if (!this.auth) return null;
+    try {
+      return await this.auth.getAuthToken();
+    } catch {
+      return null;
+    }
+  }
+
+  private openSocket(token: string | null): void {
+    const url = token ? this.withToken(this.url, token) : this.url;
+    const socket = new WebSocket(url);
+    this.socket = socket;
+
+    socket.onopen = () => {
+      this.refreshAttempts = 0;
+      this.setState('connected');
+      this.replaySubscriptions();
+    };
+
+    socket.onmessage = (event) => {
+      if (this.isAuthErrorFrame(event.data)) {
+        void this.handleAuthFailure();
+      }
+    };
+
+    socket.onclose = (event) => {
+      if (this.isAuthCloseCode(event.code)) {
+        void this.handleAuthFailure();
+        return;
+      }
+      this.setState('closed');
+    };
+
+    socket.onerror = () => {
+      // Errors surface via onclose; nothing to do here.
+    };
+  }
+
+  private isAuthCloseCode(code: RealtimeCloseCode): boolean {
+    return AUTH_CLOSE_CODES.has(code);
+  }
+
+  private isAuthErrorFrame(data: unknown): boolean {
+    if (typeof data !== 'string') return false;
+    try {
+      const parsed = JSON.parse(data) as { type?: string; code?: number };
+      if (parsed?.type === 'error' && typeof parsed.code === 'number') {
+        return AUTH_CLOSE_CODES.has(parsed.code);
+      }
+      return parsed?.type === 'auth_error';
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Handles an auth failure by refreshing the token and replaying
+   * wallet-scoped subscriptions. Guards against refresh loops and dedupes
+   * concurrent refreshes.
+   */
+  private async handleAuthFailure(): Promise<void> {
+    if (!this.auth) {
+      this.enterDegraded('auth-required', 'Authentication required for this subscription.');
+      return;
+    }
+
+    if (this.refreshAttempts >= this.maxRefreshAttempts) {
+      this.enterDegraded('auth-refresh-loop', 'Unable to re-authenticate. Showing cached data.');
+      return;
+    }
+
+    this.refreshAttempts += 1;
+    this.setState('reconnecting');
+
+    const token = await this.refreshTokenDeduped();
+    if (!token) {
+      this.enterDegraded('auth-refresh-failed', 'Session expired. Falling back to REST.');
+      return;
+    }
+
+    this.socket?.close(1000, 'reauth');
+    this.openSocket(token);
+  }
+
+  /**
+   * Dedupes concurrent refresh requests so multiple failing subscriptions
+   * share a single refresh call.
+   */
+  private refreshTokenDeduped(): Promise<string | null> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    if (!this.auth) return Promise.resolve(null);
+
+    this.refreshInFlight = this.auth
+      .refreshAuthToken()
+      .catch(() => null)
+      .finally(() => {
+        this.refreshInFlight = null;
+      });
+
+    return this.refreshInFlight;
+  }
+
+  private replaySubscriptions(): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    for (const sub of this.authenticatedSubscriptions.values()) {
+      this.socket.send(
+        JSON.stringify({ type: 'subscribe', topic: sub.topic, wallet: sub.wallet, params: sub.params }),
+      );
+    }
+  }
+
+  private enterDegraded(
+    reason: RealtimeDegradedState['reason'],
+    message: string,
+  ): void {
+    this.setState('degraded');
+    this.onDegraded?.({ reason, fallbackToRest: true, message });
+  }
+
+  private withToken(url: string, token: string): string {
+    try {
+      const parsed = new URL(url);
+      parsed.searchParams.set('token', token);
+      return parsed.toString();
+    } catch {
+      return url;
+    }
+  }
+
+  private setState(state: RealtimeConnectionState): void {
+    if (this.state === state) return;
+    this.state = state;
+    this.onStateChange?.(state);
   }
 }
-
-export const realtimeClient = new RealtimeClient();
