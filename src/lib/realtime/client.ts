@@ -1,9 +1,49 @@
+import { API_BASE_URL } from "@/lib/api/client";
+import { getRealtimeCapability } from "@/lib/realtime/capabilities";
+
+type Handler = (payload: unknown) => void;
+
+const MAX_BACKOFF_MS = 30_000;
+const BASE_BACKOFF_MS = 1_000;
+
 /**
  * Realtime WebSocket client.
  *
  * Handles connection lifecycle, subscription replay, and auth token expiry
  * for wallet-scoped subscriptions. Token acquisition is isolated behind an
  * injected AuthTokenProvider so the transport stays wallet-agnostic.
+ *
+ * A small reconnecting WebSocket wrapper exposing a subscribe-by-topic API.
+ * The backend contract this assumes (documented, not yet implemented
+ * upstream): connect to `${wsUrl}`, receive JSON messages shaped
+ * `{ topic: string, payload: unknown }`, one topic per push-based update
+ * type (e.g. "oracle_update"). Callers must treat this connection as
+ * best-effort — always keep an independent REST fetch as the source of
+ * truth for initial state.
+ *
+ * Transport is negotiated at startup via `getRealtimeCapability()`. Until
+ * capability is confirmed the client stays on REST; it only opens a socket
+ * when the backend advertises WebSocket support, avoiding reconnect loops
+ * against backends that never answer.
+ */
+
+import type {
+  AuthTokenProvider,
+  AuthenticatedSubscription,
+  RealtimeAuthOptions,
+  RealtimeCloseCode,
+  RealtimeConnectionState,
+  RealtimeDegradedState,
+} from './types';
+
+const AUTH_CLOSE_CODES: ReadonlySet<number> = new Set([4001, 4003, 4401, 4403]);
+const DEFAULT_MAX_REFRESH_ATTEMPTS = 2;
+
+export interface RealtimeClientOptions extends RealtimeAuthOptions {
+  url: string;
+  onStateChange?: (state: RealtimeConnectionState) => void;
+  onDegraded?: (state: RealtimeDegradedState) => void;
+}
  */
 
 import type {
@@ -36,6 +76,11 @@ export class RealtimeClient {
   private refreshAttempts = 0;
   private refreshInFlight: Promise<string | null> | null = null;
   private readonly authenticatedSubscriptions = new Map<string, AuthenticatedSubscription>();
+  private handlers = new Map<string, Set<Handler>>();
+  private attempt = 0;
+  private closedByUser = false;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private negotiated = false;
 
   constructor(options: RealtimeClientOptions) {
     this.url = options.url;
@@ -43,6 +88,27 @@ export class RealtimeClient {
     this.maxRefreshAttempts = options.maxRefreshAttempts ?? DEFAULT_MAX_REFRESH_ATTEMPTS;
     this.onStateChange = options.onStateChange;
     this.onDegraded = options.onDegraded;
+  }
+
+  connect(): void {
+    if (typeof WebSocket === "undefined" || this.socket) return;
+    this.closedByUser = false;
+    if (this.negotiated) {
+      this.open();
+      return;
+    }
+    void this.negotiate();
+  }
+
+  private async negotiate(): Promise<void> {
+    const capability = await getRealtimeCapability();
+    this.negotiated = true;
+    if (this.closedByUser) return;
+    if (capability.transport === "websocket") {
+      this.open();
+    }
+    // SSE and REST-only transports are handled elsewhere; this client only
+    // manages the WebSocket transport.
   }
 
   getState(): RealtimeConnectionState {
